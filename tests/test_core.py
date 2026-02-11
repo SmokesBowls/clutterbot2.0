@@ -99,3 +99,110 @@ class TestTrackPullCommit:
         clutter.commit('myproj')
 
         assert (original / 'file.txt').read_text() == 'world'
+
+
+class TestDeletedFileRecovery:
+    """The concierge feature: detect deleted tracked original, offer restore"""
+
+    def test_deleted_original_marks_as_ghost_when_no_sandbox(self, temp_clutter, monkeypatch):
+        """If no sandbox exists, deletion should mark as ghost without prompting."""
+        clutter, tmpdir = temp_clutter
+        original = tmpdir / 'original'
+        original.mkdir()
+        (original / 'file.txt').write_text('hello')
+
+        clutter.track(str(original), 'myproj')
+        # Do NOT pull – sandbox is empty
+
+        # Simulate deletion
+        shutil.rmtree(original)
+
+        # Handle deletion – should mark as ghost
+        result = clutter.handle_tracked_deletion(str(original))
+
+        assert result is False  # No recovery possible
+        with clutter.get_conn() as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT status FROM tracked_items WHERE name = ?", ('myproj',))
+            status = cursor.fetchone()[0]
+            assert status == 'ghost'
+
+    def test_deleted_original_with_sandbox_offers_restore(self, temp_clutter, monkeypatch):
+        """When sandbox exists, user should be prompted to restore."""
+        clutter, tmpdir = temp_clutter
+        original = tmpdir / 'original'
+        original.mkdir()
+        (original / 'file.txt').write_text('game code')
+
+        clutter.track(str(original), 'game')
+        clutter.pull('game')
+
+        # Simulate deletion
+        shutil.rmtree(original)
+
+        # Simulate user choosing 'r' (restore)
+        monkeypatch.setattr('builtins.input', lambda _: 'r')
+
+        result = clutter.handle_tracked_deletion(str(original))
+
+        assert result is True
+        # Original should be restored
+        assert original.exists()
+        assert (original / 'file.txt').read_text() == 'game code'
+
+        # Status should be 'tracked'
+        with clutter.get_conn() as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT status FROM tracked_items WHERE name = ?", ('game',))
+            status = cursor.fetchone()[0]
+            assert status == 'tracked'
+
+    def test_deleted_original_with_sandbox_user_chooses_ghost(self, temp_clutter, monkeypatch):
+        """User can choose to keep ghost."""
+        clutter, tmpdir = temp_clutter
+        original = tmpdir / 'original'
+        original.mkdir()
+        (original / 'file.txt').write_text('game code')
+
+        clutter.track(str(original), 'game')
+        clutter.pull('game')
+        shutil.rmtree(original)
+
+        monkeypatch.setattr('builtins.input', lambda _: 'g')
+
+        result = clutter.handle_tracked_deletion(str(original))
+
+        assert result is True
+        # Original should NOT be restored
+        assert not original.exists()
+        # Status should be 'ghost'
+        with clutter.get_conn() as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT status FROM tracked_items WHERE name = ?", ('game',))
+            status = cursor.fetchone()[0]
+            assert status == 'ghost'
+
+    def test_deleted_original_with_sandbox_user_chooses_delete(self, temp_clutter, monkeypatch):
+        """User can choose to delete tracking entirely."""
+        clutter, tmpdir = temp_clutter
+        original = tmpdir / 'original'
+        original.mkdir()
+        (original / 'file.txt').write_text('game code')
+
+        clutter.track(str(original), 'game')
+        clutter.pull('game')
+        shutil.rmtree(original)
+
+        monkeypatch.setattr('builtins.input', lambda _: 'd')
+
+        result = clutter.handle_tracked_deletion(str(original))
+
+        assert result is True
+        # Original should NOT be restored
+        assert not original.exists()
+        # Status should be 'ghost' (the spec says mark as ghost, not delete)
+        with clutter.get_conn() as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT status FROM tracked_items WHERE name = ?", ('game',))
+            status = cursor.fetchone()[0]
+            assert status == 'ghost'
