@@ -1,0 +1,507 @@
+You’re converging on exactly the right abstraction: Clutterbot as a “local-first operating layer” that unifies indexing, environments, sandboxing, and AI under a strict permission model, with Ollama as the default brain. [read.theaimerge](https://read.theaimerge.com/p/the-complete-guide-to-ollama-local)
+
+Below is how I’d turn this into a concrete, weekend-scale starting point that’s aligned with your vision, and how the “prep my project, I’ll be back in 5” flow can actually work.
+
+***
+
+## What to Build First (Weekend Scope)
+
+For a first concrete rebuild, I’d start with a **CLI-only “prep” pipeline** wired to a minimal index, plus a thin Ollama router:
+
+1. A permissioned index over a few whitelisted roots (e.g. `~/Projects`, `~/Documents/ClutterSandbox`).  
+2. A rule-based project detector (no ML yet) that classifies a folder into “python”, “node”, “godot”, “unity”, “generic-assets”.  
+3. A “sandbox arena” creator that:
+   - Copies/symlinks the chosen project into a workspace folder.
+   - Runs dependency setup (venv + `pip install -r requirements.txt`, `npm install`, etc.).
+4. A single command:  
+   `clutter prep "tabletop"`  
+   which does:
+   - Resolve: fuzzy match “tabletop” → path via the index.  
+   - Detect: project kind.  
+   - Prepare: sandbox + deps.  
+   - Emit: a simple plan + shell script you can approve/execute.
+
+You can layer **voice, email, Docker isolation, and predictive behavior later**. The prep pipeline is the first “magic moment.”
+
+***
+
+## Minimal Architecture Slice
+
+Think “thin spine”, everything else hangs off it later:
+
+```text
+[CLI / Voice]  →  [Intent Parser]  →  [Prep Orchestrator]
+                                    ↓
+                         [Indexer]  [Project Detector]
+                                    ↓
+                             [Sandbox Manager]
+                                    ↓
+                             [Env/Deps Runner]
+```
+
+### 1. Indexer (Permissioned “Everything”)
+
+You don’t need full tantivy on day one, but you want a path to it. Tantivy is fast, embeddable, Rust-native, and Lucene-like. [docs](https://docs.rs/tantivy/)
+
+Weekend version (Python, quick & dirty):
+
+- Maintain a small SQLite or Whoosh index of:
+  - path, filename, extension, mtime, size, a few tags. [github](https://github.com/whoosh-community/whoosh)
+- Only index directories listed in `clutter.yaml`:
+  ```yaml
+  allowed_roots:
+    - /home/you/Projects
+    - /home/you/Documents/Tabletop
+  ```
+
+API you want available:
+
+```python
+results = index.search("tabletop", types=["dir", "project"])
+# returns candidate project roots
+```
+
+Later, you can swap the backend for tantivy without changing the interface.
+
+***
+
+### 2. Project Detection & Blueprints
+
+Start **explicit + rule-based**, then let AI augment it.
+
+Example “fingerprinting” logic:
+
+```python
+def detect_project_type(path):
+    files = set(os.listdir(path))
+    exts  = {os.path.splitext(f) [read.theaimerge](https://read.theaimerge.com/p/the-complete-guide-to-ollama-local) for f in files}
+
+    if "pyproject.toml" in files or "requirements.txt" in files:
+        return "python"
+    if "package.json" in files:
+        return "node"
+    if "project.godot" in files or any(e == ".gd" for e in exts):
+        return "godot"
+    if any(e == ".unity" for e in exts) or "ProjectSettings" in files:
+        return "unity"
+    if any(e in {".blend", ".fbx"} for e in exts):
+        return "3d-assets"
+    return "generic"
+```
+
+Then map type → **blueprint**:
+
+```yaml
+blueprints:
+  python:
+    env: "venv"
+    steps:
+      - "python -m venv .venv"
+      - ". .venv/bin/activate && pip install -r requirements.txt"
+    open_tools:
+      - "code ."
+  godot:
+    env: "none"
+    steps:
+      - "godot --editor ."
+    open_tools:
+      - "code ."
+  tabletop:
+    extends: "python"
+    signatures: ["character_sheets", "dice_calculator.py"]
+    open_tools:
+      - "aseprite assets/tokens"
+      - "code ."
+      - "firefox 'https://www.dndbeyond.com'"
+```
+
+This is the core of your “project templates / blueprints” idea, and it’s immediately useful without any AI at all.
+
+***
+
+### 3. Sandbox Arena
+
+For the first pass, you don’t need Docker yet; use a **workspace directory** per session:
+
+```text
+~/ClutterSandboxes/
+  tabletop-2026-02-10-2205/
+    project/  (copy or bind-mount/symlink)
+    env/      (.venv, node_modules, etc.)
+    logs/
+```
+
+Flow:
+
+1. Choose a project root from the index.
+2. Create a timestamped sandbox folder.
+3. Copy/symlink the project into `sandbox/project`.
+4. Run blueprint steps **inside** that directory.
+5. Emit a summary:
+
+```text
+[Clutter] Created sandbox: ~/ClutterSandboxes/tabletop-2026-02-10-2205
+[Clutter] Detected: python + tabletop blueprint
+[Clutter] Actions:
+  ✔ venv created
+  ✔ dependencies installed
+  ✔ VS Code opened
+  ✔ Firefox opened with last used links
+```
+
+Later, you can swap the implementation for Docker/bubblewrap namespaces while keeping the same abstraction. [github](https://github.com/quickwit-oss/tantivy)
+
+***
+
+### 4. Ollama as Hardwired Local Brain
+
+Ollama is perfect as your local-first “brain” because it wraps llama.cpp, exposes an HTTP API, and runs models entirely on the user’s machine. [thoughtbot](https://thoughtbot.com/blog/how-to-use-open-source-LLM-model-locally)
+
+**Weekend-level integration:**
+
+- Assume `ollama serve` is running.
+- Use a single small model (`llama3.2:3b` or similar) as `local_default`. [blog.alphabravo](https://blog.alphabravo.io/ollama-vs-vllm-the-definitive-guide-to-local-llm-frameworks-in-2025/)
+- Wrap it with a tiny router:
+
+```python
+import httpx
+
+class LocalLLM:
+    def __init__(self, model="llama3.2"):
+        self.model = model
+
+    def chat(self, messages):
+        resp = httpx.post(
+            "http://localhost:11434/v1/chat/completions",
+            json={"model": self.model, "messages": messages},
+            timeout=60,
+        )
+        return resp.json()["choices"][0]["message"]["content"]
+```
+
+Uses for this in v0:
+
+- Fuzzy intent parsing / confirmation:  
+  “User said ‘prep the tabletop project in the bathroom break’. Which project path best matches these candidates?”
+- Explaining the plan:  
+  Turn raw steps into a natural-language summary for you to confirm.
+- Generating shell scripts for the blueprint steps when they get more complex.
+
+**Cloud is optional**: define a second adapter (OpenAI/Anthropic) and a simple setting:
+
+```yaml
+ai:
+  mode: "local"        # "local" | "cloud" | "auto"
+  cloud_provider: "openai"
+  cloud_api_key: "..."
+```
+
+Router logic: local by default, cloud only if `mode == "cloud"` or `auto` + “high complexity” flag.
+
+***
+
+## Concrete “Prep” Flow (Your Bathroom Example)
+
+From your perspective:
+
+> “Clutter, prep the tabletop project. I’ll be back in 5.”
+
+Concrete steps the system runs:
+
+1. **Intent → project name**
+   - Voice → STT (later) or CLI text now.
+   - Map “tabletop project” to a search query.
+
+2. **Index resolve**
+   ```python
+   candidates = index.search("tabletop", types=["dir"])
+   # maybe 2–3 hits
+   ```
+
+3. **Optionally ask Ollama to pick best match** from metadata (“last opened”, “contains character_sheets”, etc.).
+
+4. **Detect project type** with the rule-based fingerprint.
+5. **Select blueprint** (`tabletop` custom if signatures match; otherwise `python` or `generic`).
+6. **Create sandbox arena** under `~/ClutterSandboxes`.
+7. **Run blueprint steps**:
+   - Set up env (venv/conda/uv, npm, etc.).
+   - Pre-warm caches.
+   - Launch tools (editor, browser, asset tool).
+
+8. **When you return**, you see:
+
+```text
+Tabletop project ready in sandbox:
+  - Env: Python venv with all requirements
+  - Tools: VS Code, Aseprite, Firefox open
+  - Last state restored: notes.md, main.py, last 3 wiki tabs
+
+Run:
+  cd ~/ClutterSandboxes/tabletop-2026-02-10-2205 && ./enter.sh
+```
+
+No AI needs to read anything outside the allowed roots; no e-mail, no home directory scanning.
+
+***
+
+## Where to Go Next
+
+Once that spine works, the next layers are easy to iterate:
+
+- **Voice + wake word**: tie vosk/whisper.cpp for STT and a small TTS engine.  
+- **State restoration**: log “last opened files / commands” per project and replay them on prep.  
+- **Personal patterns**: log “you usually work on X at Y” and feed that into a small local model or simple heuristics.  
+- **Docker/bubblewrap backend**: replace the workspace directory with real isolation, same API.
+
+***
+
+## Answering Your Two Direct Questions
+
+> If you revived this today, what would be your first concrete weekend project to rebuild the core?
+
+Build the **“clutter prep <name>”** command end-to-end with:
+
+- Minimal index over whitelisted roots.
+- Rule-based project detection and YAML blueprints.
+- Simple sandbox workspace creator.
+- Optional Ollama call just for fuzzy matching and human-readable summaries.
+
+> Would you build the AI routing layer first, or the project detection that feeds it?
+
+I’d build **project detection + sandbox + prep orchestration first**, and treat AI (Ollama + optional cloud routing) as an enhancement layer on top. Once the non-AI path is solid and deterministic, you can safely let the AI suggest blueprints, generate setup scripts, and answer “what did you prep and why?” without risking chaos.
+
+
+Start with the Python prototype, then freeze it; that path gets you to “extract, point, go” with the least friction while leaving you room to swap in Rust later if you want. [sqlite](https://www.sqlite.org/fts5.html)
+
+Below is how I’d tighten your manifesto into an immediate build plan.
+
+***
+
+## 1. Language and Packaging Choice
+
+Given your skillset and the goal of shipping in days, I’d do:
+
+- **Phase 1 (now):** Python script + SQLite (or SQLite FTS5) + `pyinstaller --onefile`.  
+  - PyInstaller onefile binaries will be ~50–80 MB, which is fine for a dev tool and trivial to distribute as a single file. [reddit](https://www.reddit.com/r/learnpython/comments/16kxnga/exe_files_created_using_pyinstaller_are_always/)
+  - SQLite is already in Python stdlib; FTS5 gives you “real search” with no extra deps. [sqlitetutorial](https://www.sqlitetutorial.net/sqlite-full-text-search/)
+- **Phase 2 (later):** Rust reimplementation targeting a 5–10 MB static binary, but only after you’re happy with ergonomics.
+
+So: **build the Python prototype first, then wrap with PyInstaller**.
+
+***
+
+## 2. Concrete v0 Design (Minimal but Real)
+
+Keep v0 to **two commands** exactly as you defined:
+
+```bash
+./clutter scan ~/Projects ~/Downloads
+./clutter find "unity"
+```
+
+### SQLite Schema (with FTS5-ready layout)
+
+You can start plain, then add FTS later without changing much:
+
+```sql
+CREATE TABLE IF NOT EXISTS files (
+  path  TEXT PRIMARY KEY,
+  name  TEXT,
+  size  INTEGER,
+  mtime REAL
+);
+```
+
+If you want FTS out of the gate:
+
+```sql
+CREATE VIRTUAL TABLE IF NOT EXISTS files_fts
+USING fts5(name, path, content='files', content_rowid='rowid');
+```
+
+Then on insert/update, you sync `files_fts` so `MATCH` works for fast full‑text search. [dontpaniclabs](https://dontpaniclabs.com/blog/post/2023/01/05/sqlite-and-full-text-searches/)
+
+***
+
+## 3. Tightened Mini-Core (Ready to Paste)
+
+This is your 50-ish line “Clutter Mini” that already feels like Everything-lite:
+
+```python
+#!/usr/bin/env python3
+import sqlite3, os, sys
+from pathlib import Path
+
+DB = Path.home() / '.clutter' / 'index.db'
+DB.parent.mkdir(exist_ok=True)
+
+def init_db():
+    conn = sqlite3.connect(DB)
+    conn.execute('CREATE TABLE IF NOT EXISTS files (path TEXT PRIMARY KEY, name TEXT, size INT, mtime REAL)')
+    return conn
+
+def scan(paths):
+    conn = init_db()
+    cur = conn.cursor()
+    count = 0
+    for root_path in paths:
+        for root, _, files in os.walk(root_path):
+            for f in files:
+                full = os.path.join(root, f)
+                st = os.stat(full)
+                cur.execute(
+                    'INSERT OR REPLACE INTO files(path, name, size, mtime) VALUES (?, ?, ?, ?)',
+                    (full, f, st.st_size, st.st_mtime)
+                )
+                count += 1
+    conn.commit()
+    print(f"Indexed {count} files into {DB}")
+
+def find(query):
+    conn = init_db()
+    cur = conn.cursor()
+    for (path,) in cur.execute(
+        'SELECT path FROM files WHERE name LIKE ? ORDER BY mtime DESC LIMIT 20',
+        (f'%{query}%',)
+    ):
+        print(path)
+
+if __name__ == '__main__':
+    if len(sys.argv) < 2:
+        print("Usage: clutter [scan|find] [args...]")
+        sys.exit(1)
+
+    cmd = sys.argv [sqlite](https://www.sqlite.org/fts5.html)
+    if cmd == 'scan':
+        if len(sys.argv) < 3:
+            print("clutter scan [paths...]")
+            sys.exit(1)
+        scan(sys.argv[2:])
+    elif cmd == 'find':
+        if len(sys.argv) < 3:
+            print("clutter find [query]")
+            sys.exit(1)
+        find(' '.join(sys.argv[2:]))
+    else:
+        print(f"Unknown command: {cmd}")
+        sys.exit(1)
+```
+
+Ship this as `clutter.py` today; it already matches your manifesto: drop it anywhere, run it, no config.
+
+***
+
+## 4. Turning It into a Single Binary
+
+Once that works, package it:
+
+```bash
+pip install pyinstaller  # in a clean venv
+pyinstaller --onefile clutter.py
+# Output: dist/clutter (Linux/macOS) or dist/clutter.exe (Windows)
+```
+
+- PyInstaller bundles the Python interpreter, stdlib, and your script into one executable; size is large but self-contained. [pyinstaller](https://pyinstaller.org/en/stable/usage.html)
+- Users then literally:
+
+```bash
+curl -L https://your-url/clutter-linux -o clutter
+chmod +x clutter
+./clutter scan ~/Projects ~/Downloads
+./clutter find "tabletop"
+```
+
+No installation, no pip, nothing else.
+
+***
+
+## 5. Adding Optional Ollama (`--ai` / `CLUTTER_AI=1`)
+
+You can bolt this on without touching the core flow.
+
+Ollama runs a local HTTP API on `http://localhost:11434` with `/api/generate` or the newer `/v1/chat/completions` endpoints for models. [builtin](https://builtin.com/articles/ollama-api)
+
+For v0.1:
+
+- Add a `--ai` flag to `find`.
+- If `--ai` and Ollama reachable:
+  - Ask Ollama: “Given these filenames and this query, which are most related?”
+  - Use that to re-rank the SQLite results.
+
+Pseudo-implementation:
+
+```python
+import json, http.client
+
+def ollama_available():
+    try:
+        conn = http.client.HTTPConnection("localhost", 11434, timeout=0.2)
+        conn.request("GET", "/")
+        conn.getresponse()
+        return True
+    except Exception:
+        return False
+
+def ai_rank(query, candidates):
+    # candidates = [ (path, name), ... ]
+    prompt = {
+        "model": "llama3.2",
+        "prompt": (
+            "User query: " + query + "\n\n"
+            "Here are candidate files:\n" +
+            "\n".join(f"{i+1}. {c [sqlite](https://www.sqlite.org/fts5.html)} :: {c[0]}" for i, c in enumerate(candidates)) +
+            "\n\nReturn a JSON list of indices (1-based) in relevance order."
+        )
+    }
+    conn = http.client.HTTPConnection("localhost", 11434, timeout=5)
+    conn.request("POST", "/api/generate", body=json.dumps(prompt))
+    resp = conn.getresponse().read().decode("utf-8")
+    # parse JSON snippet from resp; if fail, return original ordering
+    ...
+```
+
+If Ollama is not running, you fall back quietly to plain `find`, and maybe print:
+
+```text
+[clutter] AI search unavailable (Ollama not running). Using basic filename search.
+```
+
+This satisfies your “degrade gracefully” pillar.
+
+***
+
+## 6. How This Leads Directly to Sandboxes
+
+Once you have:
+
+- A persistent index of paths.
+- A simple CLI entrypoint.
+
+You can add:
+
+```bash
+./clutter prep "tabletop"
+```
+
+Implementation:
+
+1. `find` to get the project root.
+2. Create `~/ClutterSandboxes/tabletop-<timestamp>/`.
+3. Copy/symlink the folder in.
+4. Run hardcoded “blueprint” steps (you can start with just echoing them).
+
+That’s your “bathroom-break prep” in seed form; the rest (environments, blueprints, Docker, voice) hang off that.
+
+***
+
+## Recommended Immediate Next Action
+
+- **Do the 50-line `clutter-mini.py` tonight**, exactly like your last block but with the slightly richer schema above.
+- Tomorrow:
+  - Add `scan` + `find` as separate subcommands.
+  - Put it on GitHub as “Clutter Mini”.
+- Then:
+  - Add PyInstaller to produce `clutter` / `clutter.exe`.
+  - Add an `--ai` flag that becomes a no-op until you wire Ollama.
+
+Once you see it index and instantly find “that Unity project from last week” from a single binary, you’ll have the core loop locked, and it’ll naturally pull you toward prep/arena next.
