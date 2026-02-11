@@ -18,6 +18,7 @@ import subprocess
 import shutil
 from pathlib import Path
 from datetime import datetime
+from contextlib import contextmanager
 from typing import List, Tuple, Optional
 
 # Configuration
@@ -30,11 +31,31 @@ IGNORE_EXTS = {'.pyc', '.pyo', '.so', '.o', '.a', '.dll', '.exe'}
 class Clutter:
     def __init__(self, db_path: str = None):
         self.db_path = Path(db_path) if db_path else DB_PATH
+        self.base_dir = self.db_path.parent
         self.db_path.parent.mkdir(exist_ok=True)
         self.conn = None
         self.monitoring = False
         self.change_log = []
         self.init_db()
+        self.detect_capabilities()
+
+    @contextmanager
+    def get_conn(self):
+        """Context manager for guaranteed database connection cleanup."""
+        conn = self.connect()
+        try:
+            yield conn
+        finally:
+            conn.close()
+
+    def detect_capabilities(self):
+        """Detect database and system capabilities."""
+        with self.get_conn() as conn:
+            try:
+                conn.execute("SELECT fts5_decode(NULL)")
+                self.has_fts5 = True
+            except sqlite3.OperationalError:
+                self.has_fts5 = False
     
     def connect(self):
         """Connect to SQLite database"""
@@ -834,25 +855,23 @@ JSON:"""
             return
 
         # VALIDATE: name must not already be in use
-        conn = self.connect()
-        cursor = conn.cursor()
-        cursor.execute("SELECT path FROM tracked_items WHERE name = ?", (name,))
-        existing = cursor.fetchone()
-        if existing:
-            print(f"Error: Name '{name}' already tracks {existing[0]}")
-            conn.close()
-            return
+        with self.get_conn() as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT path FROM tracked_items WHERE name = ?", (name,))
+            existing = cursor.fetchone()
+            if existing:
+                print(f"Error: Name '{name}' already tracks {existing[0]}")
+                return
 
-        # 1. Insert into tracked_items
-        conn.execute("""
-            INSERT OR REPLACE INTO tracked_items (path, name, status)
-            VALUES (?, ?, 'tracked')
-        """, (path, name))
-        conn.commit()
-        conn.close()
+            # 1. Insert into tracked_items
+            conn.execute("""
+                INSERT OR REPLACE INTO tracked_items (path, name, status)
+                VALUES (?, ?, 'tracked')
+            """, (path, name))
+            conn.commit()
 
         # 2. Create ref symlink (lightweight pointer)
-        ref_dir = self.db_path.parent / 'refs'
+        ref_dir = self.base_dir / 'refs'
         ref_dir.mkdir(exist_ok=True)
         ref_path = ref_dir / name
         if os.path.lexists(ref_path):
@@ -860,7 +879,7 @@ JSON:"""
         os.symlink(path, str(ref_path), target_is_directory=os.path.isdir(path))
 
         # 3. Create empty sandbox dir (placeholder, no content)
-        sandbox_path = self.db_path.parent / 'sandboxes' / name
+        sandbox_path = self.base_dir / 'sandboxes' / name
         sandbox_path.mkdir(parents=True, exist_ok=True)
 
         # 4. Write minimal metadata
@@ -881,21 +900,20 @@ JSON:"""
     def pull(self, name_or_path):
         """Create a working copy in the sandbox. Preserve previous as snapshot."""
         # Resolve the tracked item
-        conn = self.connect()
-        cursor = conn.cursor()
-        cursor.execute(
-            "SELECT path, name, status FROM tracked_items WHERE name = ? OR path = ?",
-            (name_or_path, name_or_path)
-        )
-        row = cursor.fetchone()
-        conn.close()
+        with self.get_conn() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                "SELECT path, name, status FROM tracked_items WHERE name = ? OR path = ?",
+                (name_or_path, name_or_path)
+            )
+            row = cursor.fetchone()
 
         if not row:
             print(f"Error: '{name_or_path}' is not tracked")
             return
 
         original_path, name, status = row
-        sandbox_path = self.db_path.parent / 'sandboxes' / name
+        sandbox_path = self.base_dir / 'sandboxes' / name
 
         # STEP 1: Snapshot existing sandbox if it has content
         has_content = any(
@@ -905,7 +923,7 @@ JSON:"""
 
         snapshot_dest = None
         if has_content:
-            snapshot_root = self.db_path.parent / 'snapshots' / name
+            snapshot_root = self.base_dir / 'snapshots' / name
             snapshot_root.mkdir(parents=True, exist_ok=True)
             snapshot_dest = snapshot_root / f"pre_pull_{int(time.time())}"
             print(f"📸 Preserving previous sandbox as snapshot...")
@@ -923,10 +941,9 @@ JSON:"""
         if not os.path.exists(original_path):
             print(f"⚠️  Original missing at {original_path}")
             print(f"   Status: ghost")
-            conn = self.connect()
-            conn.execute("UPDATE tracked_items SET status = 'ghost' WHERE name = ?", (name,))
-            conn.commit()
-            conn.close()
+            with self.get_conn() as conn:
+                conn.execute("UPDATE tracked_items SET status = 'ghost' WHERE name = ?", (name,))
+                conn.commit()
 
             if has_content:
                 print(f"   Previous snapshot preserved at: {snapshot_dest}")
@@ -949,14 +966,13 @@ JSON:"""
             shutil.copy2(original_path, str(sandbox_path / os.path.basename(original_path)))
 
         # STEP 4: Update database
-        conn = self.connect()
-        conn.execute("""
-            UPDATE tracked_items
-            SET last_pulled = ?, status = 'pulled', snapshot_path = ?
-            WHERE name = ?
-        """, (time.time(), str(snapshot_dest) if snapshot_dest else None, name))
-        conn.commit()
-        conn.close()
+        with self.get_conn() as conn:
+            conn.execute("""
+                UPDATE tracked_items
+                SET last_pulled = ?, status = 'pulled', snapshot_path = ?
+                WHERE name = ?
+            """, (time.time(), str(snapshot_dest) if snapshot_dest else None, name))
+            conn.commit()
 
         print(f"✅ Pull complete")
         print(f"   Working copy: {sandbox_path}")
@@ -966,21 +982,20 @@ JSON:"""
     def commit(self, name_or_path):
         """Sync sandbox changes back to original with safety snapshots."""
         # Resolve the tracked item
-        conn = self.connect()
-        cursor = conn.cursor()
-        cursor.execute(
-            "SELECT path, name, status FROM tracked_items WHERE name = ? OR path = ?",
-            (name_or_path, name_or_path)
-        )
-        row = cursor.fetchone()
-        conn.close()
+        with self.get_conn() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                "SELECT path, name, status FROM tracked_items WHERE name = ? OR path = ?",
+                (name_or_path, name_or_path)
+            )
+            row = cursor.fetchone()
 
         if not row:
             print(f"Error: '{name_or_path}' is not tracked")
             return
 
         original_path, name, status = row
-        sandbox_path = self.db_path.parent / 'sandboxes' / name
+        sandbox_path = self.base_dir / 'sandboxes' / name
 
         # CHECK: sandbox must have content
         has_content = any(
@@ -996,7 +1011,7 @@ JSON:"""
         # STEP 1: Snapshot ORIGINAL
         snapshot_dest = None
         if os.path.exists(original_path):
-            snapshot_root = self.db_path.parent / 'snapshots' / name
+            snapshot_root = self.base_dir / 'snapshots' / name
             snapshot_root.mkdir(parents=True, exist_ok=True)
             snapshot_dest = snapshot_root / f"pre_commit_{int(time.time())}"
             print(f"📸 Snapshotting original before commit...")
@@ -1040,14 +1055,14 @@ JSON:"""
                 shutil.copy2(str(src_file), original_path)
 
         # STEP 3: Update DB
-        conn = self.connect()
-        conn.execute("""
-            UPDATE tracked_items
-            SET last_committed = ?, status = 'committed', snapshot_path = ?
-            WHERE name = ?
-        """, (time.time(), str(snapshot_dest) if snapshot_dest else None, name))
-        conn.commit()
-        conn.close()
+        with self.get_conn() as conn:
+            conn.execute("""
+                UPDATE tracked_items
+                SET last_committed = ?, status = 'committed', snapshot_path = ?
+                WHERE name = ?
+            """, (time.time(), str(snapshot_dest) if snapshot_dest else None, name))
+            conn.commit()
+
         print(f"✅ Commit complete")
         if snapshot_dest:
             print(f"   Previous original saved: {snapshot_dest}")
