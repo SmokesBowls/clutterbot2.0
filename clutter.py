@@ -39,6 +39,95 @@ class Clutter:
         self.init_db()
         self.detect_capabilities()
 
+    def handle_tracked_deletion(self, path: str) -> bool:
+        """
+        Handle deletion of a tracked original.
+        Returns True if handled, False if user cancelled or no sandbox.
+        This is synchronous and testable (no watchdog event loop).
+        """
+        with self.get_conn() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                "SELECT name, snapshot_path FROM tracked_items WHERE path = ?",
+                (path,)
+            )
+            row = cursor.fetchone()
+
+        if not row:
+            return False  # Not tracked
+
+        name, snapshot_path = row
+        sandbox_path = self.base_dir / 'sandboxes' / name
+
+        has_ghost = any(
+            f.name != '.clutter_sandbox'
+            for f in sandbox_path.iterdir()
+        ) if sandbox_path.exists() else False
+
+        if not has_ghost:
+            print(f"⚠️  Tracked item deleted: {name}")
+            print(f"   No sandbox available. Cannot recover.")
+            with self.get_conn() as conn:
+                conn.execute(
+                    "UPDATE tracked_items SET status = 'ghost' WHERE path = ?",
+                    (path,)
+                )
+                conn.commit()
+            return False
+
+        print(f"\n⚠️  TRACKED ITEM DELETED: {path}")
+        print(f"   Alias: '{name}'")
+        print(f"   Ghost available in: {sandbox_path}\n")
+        print(f"   [R] Restore — recover from sandbox")
+        print(f"   [G] Keep ghost — decide later")
+        print(f"   [D] Delete for real — remove tracking")
+
+        choice = input("   Choice [R/g/d]: ").strip().lower()
+
+        if choice == 'd':
+            with self.get_conn() as conn:
+                conn.execute(
+                    "UPDATE tracked_items SET status = 'ghost' WHERE path = ?",
+                    (path,)
+                )
+                conn.commit()
+            print("   Marked as ghost.")
+            return True
+
+        elif choice == 'g':
+            with self.get_conn() as conn:
+                conn.execute(
+                    "UPDATE tracked_items SET status = 'ghost' WHERE path = ?",
+                    (path,)
+                )
+                conn.commit()
+            print(f"   👻 Ghost preserved.")
+            return True
+
+        else:  # Restore
+            try:
+                os.makedirs(os.path.dirname(path), exist_ok=True)
+                if os.path.isdir(sandbox_path):
+                    shutil.copytree(
+                        str(sandbox_path), path,
+                        ignore=shutil.ignore_patterns('.clutter_sandbox')
+                    )
+                else:
+                    shutil.copy2(str(sandbox_path), path)
+
+                with self.get_conn() as conn:
+                    conn.execute(
+                        "UPDATE tracked_items SET status = 'tracked' WHERE path = ?",
+                        (path,)
+                    )
+                    conn.commit()
+
+                print(f"   ✅ Restored to {path}")
+                return True
+            except Exception as e:
+                print(f"   ❌ Restore failed: {e}")
+                return False
+
     @contextmanager
     def get_conn(self):
         """Context manager for guaranteed database connection cleanup."""
