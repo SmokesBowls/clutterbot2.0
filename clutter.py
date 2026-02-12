@@ -538,6 +538,9 @@ JSON:"""
             
             def _reset_color(self):
                 return "\033[0m"
+
+            def _is_green(self, path):
+                return self.outer._is_under_symlink(path) or bool(self.sandbox_path)
             
             def on_created(self, event):
                 if not event.is_directory:
@@ -550,88 +553,10 @@ JSON:"""
             
             def on_deleted(self, event):
                 path = os.path.abspath(event.src_path)
-                color = self._get_color(path)
-                reset = self._reset_color()
-                print(f"{color}[-] {path}{reset}")
-
-                # Check if this was a tracked original
-                conn = self.outer.connect()
-                cursor = conn.cursor()
-                cursor.execute(
-                    "SELECT name, snapshot_path FROM tracked_items WHERE path = ?",
-                    (path,)
-                )
-                row = cursor.fetchone()
-
-                if row:
-                    name, snapshot_path = row
-                    sandbox_path = self.outer.db_path.parent / 'sandboxes' / name
-
-                    # Check if sandbox has a working copy (ghost candidate)
-                    has_ghost = any(
-                        f.name != '.clutter_sandbox'
-                        for f in sandbox_path.iterdir()
-                    ) if sandbox_path.exists() else False
-
-                    print(f"\n⚠️  TRACKED ITEM DELETED: {path}")
-                    print(f"   This item is managed by Clutter as '{name}'")
-
-                    if has_ghost:
-                        print(f"   Ghost copy available in sandbox: {sandbox_path}")
-                        print()
-                        print(f"   [R] Restore — copy ghost back to original location")
-                        print(f"   [G] Keep ghost — mark as ghost, decide later")
-                        print(f"   [D] Delete for real — remove tracking and ghost")
-                        choice = input("   Choice [R/g/d]: ").strip().lower()
-
-                        if choice == 'd':
-                            # Full delete - Actually spec says "remove tracking and ghost" 
-                            # but logic provided says mark as ghost. 
-                            # Let's follow the spec text: "UPDATE tracked_items SET status = 'ghost' ..."
-                            conn.execute(
-                                "UPDATE tracked_items SET status = 'ghost' WHERE path = ?",
-                                (path,)
-                            )
-                            conn.commit()
-                            print(f"   Marked as ghost. Run 'clutter untrack {name}' to fully remove.")
-                        elif choice == 'g':
-                            conn.execute(
-                                "UPDATE tracked_items SET status = 'ghost' WHERE path = ?",
-                                (path,)
-                            )
-                            conn.commit()
-                            print(f"   👻 Ghost preserved. Restore later with 'clutter commit {name}'")
-                        else:
-                            # Restore from sandbox
-                            if os.path.isdir(sandbox_path):
-                                os.makedirs(os.path.dirname(path), exist_ok=True)
-                                shutil.copytree(str(sandbox_path), path,
-                                               ignore=shutil.ignore_patterns('.clutter_sandbox'))
-                            else:
-                                # file recovery logic needed if it was a file
-                                # sandbox_path for a file is a directory containing the file
-                                src_file = sandbox_path / os.path.basename(path)
-                                if src_file.exists():
-                                    shutil.copy2(str(src_file), path)
-
-                            print(f"   ✅ Restored to {path}")
-                            conn.execute(
-                                "UPDATE tracked_items SET status = 'tracked' WHERE path = ?",
-                                (path,)
-                            )
-                            conn.commit()
-                    else:
-                        print(f"   ⚠️  No ghost available (never pulled)")
-                        print(f"   Cannot recover. Remove tracking with 'clutter untrack {name}'")
-                        conn.execute(
-                            "UPDATE tracked_items SET status = 'ghost' WHERE path = ?",
-                            (path,)
-                        )
-                        conn.commit()
-
-                conn.close()
-                is_green = self.outer._is_under_symlink(path) or bool(self.sandbox_path)
-                self.outer._log_change('deleted', path, is_green=is_green)
+                # Log the change
+                self.outer._log_change('deleted', path, is_green=self._is_green(path))
+                # Handle recovery (this will prompt the user)
+                self.outer.handle_tracked_deletion(path)
             
             def on_moved(self, event):
                 src = os.path.abspath(event.src_path)
