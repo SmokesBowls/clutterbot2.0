@@ -39,6 +39,24 @@ class Clutter:
         self.init_db()
         self.detect_capabilities()
 
+    @contextmanager
+    def get_conn(self):
+        """Context manager for guaranteed database connection cleanup."""
+        conn = self.connect()
+        try:
+            yield conn
+        finally:
+            conn.close()
+
+    def detect_capabilities(self):
+        """Detect database and system capabilities."""
+        with self.get_conn() as conn:
+            try:
+                conn.execute("SELECT fts5_decode(NULL)")
+                self.has_fts5 = True
+            except sqlite3.OperationalError:
+                self.has_fts5 = False
+
     def handle_tracked_deletion(self, path: str) -> bool:
         """
         Handle deletion of a tracked original.
@@ -127,24 +145,6 @@ class Clutter:
             except Exception as e:
                 print(f"   ❌ Restore failed: {e}")
                 return False
-
-    @contextmanager
-    def get_conn(self):
-        """Context manager for guaranteed database connection cleanup."""
-        conn = self.connect()
-        try:
-            yield conn
-        finally:
-            conn.close()
-
-    def detect_capabilities(self):
-        """Detect database and system capabilities."""
-        with self.get_conn() as conn:
-            try:
-                conn.execute("SELECT fts5_decode(NULL)")
-                self.has_fts5 = True
-            except sqlite3.OperationalError:
-                self.has_fts5 = False
     
     def connect(self):
         """Connect to SQLite database"""
