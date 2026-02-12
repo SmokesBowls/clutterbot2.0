@@ -137,3 +137,605 @@ If you want, next step we can:
 
 * Define Clutter’s true product identity, or
 * Convert this into a prioritized architectural refactor plan.
+
+Perfect! This is exactly where we expected to be. The test suite found the missing `get_conn` method immediately. Now we add it and the rest of the refactor.
+
+---
+
+## 🔧 Fix `clutter.py` – Add `get_conn` and refactor DB usage
+
+Open `clutter.py` in your editor. We'll make four small changes:
+
+### 1. Add import at the top (line ~4)
+```python
+from contextlib import contextmanager
+```
+
+### 2. Add `get_conn` method inside the `Clutter` class (anywhere after `__init__`)
+```python
+    @contextmanager
+    def get_conn(self):
+        """Context manager for guaranteed database connection cleanup."""
+        conn = self.connect()
+        try:
+            yield conn
+        finally:
+            conn.close()
+```
+
+### 3. Update `__init__` to set `base_dir` and ensure DB init
+```python
+    def __init__(self, db_path: str = None):
+        self.db_path = Path(db_path) if db_path else DB_PATH
+        self.base_dir = self.db_path.parent   # <-- ADD THIS LINE
+        self.db_path.parent.mkdir(exist_ok=True)
+        self.conn = None
+        self.monitoring = False
+        self.change_log = []
+        self.init_db()          # <-- MAKE SURE THIS IS CALLED
+        self.detect_capabilities()
+```
+
+### 4. Refactor `track()` to use `get_conn()` – already provided in my previous message.  
+**Replace the whole `track()` method with the version from step 6.**
+
+### 5. Refactor `pull()` to use `get_conn()` – also already provided in step 8.  
+**Replace the whole `pull()` method with the refactored version.**
+
+### 6. Refactor `commit()` to use `get_conn()` – apply the same pattern.
+
+Here's the refactored `commit()`:
+
+```python
+    def commit(self, name_or_path):
+        """Sync sandbox changes back to original with safety snapshots."""
+        # Resolve the tracked item
+        with self.get_conn() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                "SELECT path, name, status FROM tracked_items WHERE name = ? OR path = ?",
+                (name_or_path, name_or_path)
+            )
+            row = cursor.fetchone()
+
+        if not row:
+            print(f"Error: '{name_or_path}' is not tracked")
+            return
+
+        original_path, name, status = row
+        sandbox_path = self.base_dir / 'sandboxes' / name
+
+        # CHECK: sandbox must have content
+        has_content = any(
+            f.name != '.clutter_sandbox'
+            for f in sandbox_path.iterdir()
+        ) if sandbox_path.exists() else False
+
+        if not has_content:
+            print(f"Error: Sandbox '{name}' is empty. Nothing to commit.")
+            print(f"   Run 'clutter pull {name}' first.")
+            return
+
+        # STEP 1: Snapshot ORIGINAL
+        snapshot_dest = None
+        if os.path.exists(original_path):
+            snapshot_root = self.base_dir / 'snapshots' / name
+            snapshot_root.mkdir(parents=True, exist_ok=True)
+            snapshot_dest = snapshot_root / f"pre_commit_{int(time.time())}"
+            print(f"📸 Snapshotting original before commit...")
+
+            if os.path.isdir(original_path):
+                shutil.copytree(original_path, str(snapshot_dest))
+            else:
+                snapshot_dest.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(original_path, str(snapshot_dest / os.path.basename(original_path)))
+        else:
+            print(f"⚠️  Original not found at {original_path}")
+            print(f"   Will create it from sandbox copy.")
+
+        # STEP 2: Copy sandbox → original (safe swap)
+        print(f"📤 Committing sandbox/{name} → {original_path}...")
+        items_to_copy = [f for f in sandbox_path.iterdir() if f.name != '.clutter_sandbox']
+
+        if os.path.isdir(original_path) or not os.path.exists(original_path) or any(item.is_dir() for item in items_to_copy):
+            temp_path = str(original_path) + '.clutter_temp'
+            if os.path.exists(temp_path):
+                shutil.rmtree(temp_path) if os.path.isdir(temp_path) else os.remove(temp_path)
+            
+            os.makedirs(temp_path, exist_ok=True)
+            for item in items_to_copy:
+                dst = os.path.join(temp_path, item.name)
+                if item.is_dir():
+                    shutil.copytree(str(item), dst)
+                else:
+                    shutil.copy2(str(item), dst)
+
+            bak_path = str(original_path) + '.clutter_bak'
+            if os.path.exists(original_path):
+                os.rename(original_path, bak_path)
+            os.rename(temp_path, original_path)
+            if os.path.exists(bak_path):
+                shutil.rmtree(bak_path) if os.path.isdir(bak_path) else os.remove(bak_path)
+        else:
+            # Single file commit (assuming sandbox has one file matching original name)
+            src_file = sandbox_path / os.path.basename(original_path)
+            if src_file.exists():
+                shutil.copy2(str(src_file), original_path)
+
+        # STEP 3: Update DB
+        with self.get_conn() as conn:
+            conn.execute("""
+                UPDATE tracked_items
+                SET last_committed = ?, status = 'committed', snapshot_path = ?
+                WHERE name = ?
+            """, (time.time(), str(snapshot_dest) if snapshot_dest else None, name))
+            conn.commit()
+
+        print(f"✅ Commit complete")
+        if snapshot_dest:
+            print(f"   Previous original saved: {snapshot_dest}")
+```
+
+---
+
+## ✅ Run the tests again
+
+```bash
+pytest tests/ -v
+```
+
+**Expected:** All 5 tests pass. You should see:
+
+```
+collected 5 items
+tests/test_core.py::TestTrackPullCommit::test_track_creates_metadata PASSED [ 20%]
+tests/test_core.py::TestTrackPullCommit::test_track_creates_ref_symlink PASSED [ 40%]
+tests/test_core.py::TestTrackPullCommit::test_track_creates_sandbox_dir PASSED [ 60%]
+tests/test_core.py::TestTrackPullCommit::test_pull_copies_original_to_sandbox PASSED [ 80%]
+tests/test_core.py::TestTrackPullCommit::test_commit_syncs_sandbox_back_to_original PASSED [100%]
+```
+
+---
+
+## 📦 Commit the working state
+
+```bash
+git add clutter.py tests/test_core.py
+git commit -m "refactor(db): use context manager for DB connections; add tests for track/pull/commit"
+git push origin main
+```
+
+---
+
+## 🎉 Day 1 complete!
+
+You now have:
+
+- A tested, stable core workflow.
+- Clean DB connection handling.
+- A safety net for future changes.
+
+**Next (Day 2):**  
+We'll write tests for snapshot creation and the deleted‑file recovery handler, then extract that handler from the watchdog event class.
+
+But first, let's celebrate passing all five tests. Reply when you're green.
+
+(base) burdens@pop-os:~/clutterbot2.0$ pytest tests/ -v
+============================= test session starts ==============================
+platform linux -- Python 3.13.11, pytest-9.0.2, pluggy-1.5.0 -- /home/burdens/miniconda3/bin/python3.13
+cachedir: .pytest_cache
+rootdir: /home/burdens/clutterbot2.0
+plugins: cov-7.0.0, asyncio-1.3.0, anyio-4.12.1
+asyncio: mode=Mode.STRICT, debug=False, asyncio_default_fixture_loop_scope=None, asyncio_default_test_loop_scope=function
+collected 5 items                                                              
+
+tests/test_core.py::TestTrackPullCommit::test_track_creates_metadata PASSED [ 20%]
+tests/test_core.py::TestTrackPullCommit::test_track_creates_ref_symlink PASSED [ 40%]
+tests/test_core.py::TestTrackPullCommit::test_track_creates_sandbox_dir PASSED [ 60%]
+tests/test_core.py::TestTrackPullCommit::test_pull_copies_original_to_sandbox PASSED [ 80%]
+tests/test_core.py::TestTrackPullCommit::test_commit_syncs_sandbox_back_to_original PASSED [100%]
+
+============================== 5 passed in 0.20s ===============================
+(base) burdens@pop-os:~/clutterbot2.0$ 
+
+**Day 1 complete. Green. Good.**
+
+Now we move to **Day 2 – Snapshot & Recovery Tests**.
+
+---
+
+## 🎯 Day 2, Step 1 – Test Snapshot Creation
+
+We need to verify that `pull()` correctly snapshots an existing sandbox before overwriting it.
+
+Add this test to `tests/test_core.py` inside `TestTrackPullCommit`:
+
+```python
+    def test_pull_snapshots_existing_sandbox(self, temp_clutter):
+        clutter, tmpdir = temp_clutter
+        original = tmpdir / 'original'
+        original.mkdir()
+        (original / 'file.txt').write_text('v1')
+
+        clutter.track(str(original), 'myproj')
+        clutter.pull('myproj')
+
+        # Modify sandbox
+        sandbox = clutter.base_dir / 'sandboxes' / 'myproj'
+        (sandbox / 'file.txt').write_text('v2')
+
+        # Change original
+        (original / 'file.txt').write_text('v1_new')
+
+        # Pull again - should snapshot the v2 sandbox
+        clutter.pull('myproj')
+
+        # Verify snapshot was created
+        snapshot_root = clutter.base_dir / 'snapshots' / 'myproj'
+        assert snapshot_root.exists(), "Snapshot directory not created"
+        snapshots = list(snapshot_root.glob('pre_pull_*'))
+        assert len(snapshots) > 0, "No pre_pull snapshot found"
+
+        # Verify snapshot contains v2 content
+        if snapshots:
+            snapshot_file = snapshots[0] / 'file.txt'
+            assert snapshot_file.exists(), "Snapshot missing file.txt"
+            assert snapshot_file.read_text() == 'v2', "Snapshot content mismatch"
+```
+
+**Run the test**:
+
+```bash
+pytest tests/test_core.py::TestTrackPullCommit::test_pull_snapshots_existing_sandbox -v
+```
+
+It should **pass** – your existing `pull()` logic already does this. (If it fails, we'll debug.)
+
+---
+
+## 🎯 Day 2, Step 2 – Extract Deleted‑File Recovery Logic
+
+Your current `on_deleted()` in `watch()` contains ~100 lines of interactive recovery logic. This cannot be tested as‑is because:
+- It's inside a watchdog event handler.
+- It uses `input()`.
+- It's tightly coupled to the event object.
+
+We need to **extract** a pure method that takes a path and returns a result.
+
+### 2.1 Add `handle_tracked_deletion()` to the `Clutter` class
+
+Add this method **after `__init__`** (I'll give you the exact code):
+
+```python
+    def handle_tracked_deletion(self, path: str) -> bool:
+        """
+        Handle deletion of a tracked original.
+        Returns True if handled, False if user cancelled or no sandbox.
+        This is synchronous and testable (no watchdog event loop).
+        """
+        with self.get_conn() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                "SELECT name, snapshot_path FROM tracked_items WHERE path = ?",
+                (path,)
+            )
+            row = cursor.fetchone()
+
+        if not row:
+            return False  # Not tracked
+
+        name, snapshot_path = row
+        sandbox_path = self.base_dir / 'sandboxes' / name
+
+        has_ghost = any(
+            f.name != '.clutter_sandbox'
+            for f in sandbox_path.iterdir()
+        ) if sandbox_path.exists() else False
+
+        if not has_ghost:
+            print(f"⚠️  Tracked item deleted: {name}")
+            print(f"   No sandbox available. Cannot recover.")
+            with self.get_conn() as conn:
+                conn.execute(
+                    "UPDATE tracked_items SET status = 'ghost' WHERE path = ?",
+                    (path,)
+                )
+                conn.commit()
+            return False
+
+        print(f"\n⚠️  TRACKED ITEM DELETED: {path}")
+        print(f"   Alias: '{name}'")
+        print(f"   Ghost available in: {sandbox_path}\n")
+        print(f"   [R] Restore — recover from sandbox")
+        print(f"   [G] Keep ghost — decide later")
+        print(f"   [D] Delete for real — remove tracking")
+
+        choice = input("   Choice [R/g/d]: ").strip().lower()
+
+        if choice == 'd':
+            with self.get_conn() as conn:
+                conn.execute(
+                    "UPDATE tracked_items SET status = 'ghost' WHERE path = ?",
+                    (path,)
+                )
+                conn.commit()
+            print("   Marked as ghost.")
+            return True
+
+        elif choice == 'g':
+            with self.get_conn() as conn:
+                conn.execute(
+                    "UPDATE tracked_items SET status = 'ghost' WHERE path = ?",
+                    (path,)
+                )
+                conn.commit()
+            print(f"   👻 Ghost preserved.")
+            return True
+
+        else:  # Restore
+            try:
+                os.makedirs(os.path.dirname(path), exist_ok=True)
+                if os.path.isdir(sandbox_path):
+                    shutil.copytree(
+                        str(sandbox_path), path,
+                        ignore=shutil.ignore_patterns('.clutter_sandbox')
+                    )
+                else:
+                    shutil.copy2(str(sandbox_path), path)
+
+                with self.get_conn() as conn:
+                    conn.execute(
+                        "UPDATE tracked_items SET status = 'tracked' WHERE path = ?",
+                        (path,)
+                    )
+                    conn.commit()
+
+                print(f"   ✅ Restored to {path}")
+                return True
+            except Exception as e:
+                print(f"   ❌ Restore failed: {e}")
+                return False
+```
+
+### 2.2 Update the watchdog handler to use this method
+
+Replace the `on_deleted()` method inside `ClutterEventHandler` with:
+
+```python
+            def on_deleted(self, event):
+                path = os.path.abspath(event.src_path)
+                # Log the change
+                self.outer._log_change('deleted', path, is_green=self._is_green(path))
+                # Handle recovery (non-blocking in this context – but it's synchronous)
+                self.outer.handle_tracked_deletion(path)
+```
+
+This is much cleaner and testable.
+
+---
+
+## 🎯 Day 2, Step 3 – Write Tests for Deleted‑File Recovery
+
+Add a new test class at the bottom of `tests/test_core.py`:
+
+```python
+class TestDeletedFileRecovery:
+    """The concierge feature: detect deleted tracked original, offer restore"""
+
+    def test_deleted_original_marks_as_ghost_when_no_sandbox(self, temp_clutter, monkeypatch):
+        """If no sandbox exists, deletion should mark as ghost without prompting."""
+        clutter, tmpdir = temp_clutter
+        original = tmpdir / 'original'
+        original.mkdir()
+        (original / 'file.txt').write_text('hello')
+
+        clutter.track(str(original), 'myproj')
+        # Do NOT pull – sandbox is empty
+
+        # Simulate deletion
+        shutil.rmtree(original)
+
+        # Handle deletion – should mark as ghost
+        result = clutter.handle_tracked_deletion(str(original))
+
+        assert result is False  # No recovery possible
+        with clutter.get_conn() as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT status FROM tracked_items WHERE name = ?", ('myproj',))
+            status = cursor.fetchone()[0]
+            assert status == 'ghost'
+
+    def test_deleted_original_with_sandbox_offers_restore(self, temp_clutter, monkeypatch):
+        """When sandbox exists, user should be prompted to restore."""
+        clutter, tmpdir = temp_clutter
+        original = tmpdir / 'original'
+        original.mkdir()
+        (original / 'file.txt').write_text('game code')
+
+        clutter.track(str(original), 'game')
+        clutter.pull('game')
+
+        # Simulate deletion
+        shutil.rmtree(original)
+
+        # Simulate user choosing 'r' (restore)
+        monkeypatch.setattr('builtins.input', lambda _: 'r')
+
+        result = clutter.handle_tracked_deletion(str(original))
+
+        assert result is True
+        # Original should be restored
+        assert original.exists()
+        assert (original / 'file.txt').read_text() == 'game code'
+
+        # Status should be 'tracked'
+        with clutter.get_conn() as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT status FROM tracked_items WHERE name = ?", ('game',))
+            status = cursor.fetchone()[0]
+            assert status == 'tracked'
+
+    def test_deleted_original_with_sandbox_user_chooses_ghost(self, temp_clutter, monkeypatch):
+        """User can choose to keep ghost."""
+        clutter, tmpdir = temp_clutter
+        original = tmpdir / 'original'
+        original.mkdir()
+        (original / 'file.txt').write_text('game code')
+
+        clutter.track(str(original), 'game')
+        clutter.pull('game')
+        shutil.rmtree(original)
+
+        monkeypatch.setattr('builtins.input', lambda _: 'g')
+
+        result = clutter.handle_tracked_deletion(str(original))
+
+        assert result is True
+        # Original should NOT be restored
+        assert not original.exists()
+        # Status should be 'ghost'
+        with clutter.get_conn() as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT status FROM tracked_items WHERE name = ?", ('game',))
+            status = cursor.fetchone()[0]
+            assert status == 'ghost'
+
+    def test_deleted_original_with_sandbox_user_chooses_delete(self, temp_clutter, monkeypatch):
+        """User can choose to delete tracking entirely."""
+        clutter, tmpdir = temp_clutter
+        original = tmpdir / 'original'
+        original.mkdir()
+        (original / 'file.txt').write_text('game code')
+
+        clutter.track(str(original), 'game')
+        clutter.pull('game')
+        shutil.rmtree(original)
+
+        monkeypatch.setattr('builtins.input', lambda _: 'd')
+
+        result = clutter.handle_tracked_deletion(str(original))
+
+        assert result is True
+        # Original should NOT be restored
+        assert not original.exists()
+        # Status should be 'ghost' (the spec says mark as ghost, not delete)
+        with clutter.get_conn() as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT status FROM tracked_items WHERE name = ?", ('game',))
+            status = cursor.fetchone()[0]
+            assert status == 'ghost'
+```
+
+**Note:** We use `monkeypatch` to simulate user input. This is a built‑in pytest fixture.
+
+---
+
+## 🎯 Day 2, Step 4 – Run the Recovery Tests
+
+```bash
+pytest tests/test_core.py::TestDeletedFileRecovery -v
+```
+
+**Expected:** All tests pass.
+
+---
+
+## 🎯 Day 2, Step 5 – Add `clutter doctor` Command (Bonus)
+
+This is low‑hanging fruit for the zero‑install promise. Add a simple command that reports capabilities and environment.
+
+Add to the `Clutter` class:
+
+```python
+    def doctor(self):
+        """Report system capabilities and diagnose common issues."""
+        print("🔍 Clutter Doctor")
+        print("=================")
+        print(f"Version: {VERSION}")
+        print(f"OS: {platform.system()} {platform.release()}")
+        print(f"Python: {sys.version}")
+        print(f"Database: {self.db_path}")
+        
+        print("\n📦 Capabilities:")
+        print(f"  Symlinks: {'✅' if self.can_symlink else '❌'}")
+        print(f"  Watchdog (real‑time): {'✅' if self.capabilities.get('watchdog') else '❌ (fallback: polling)'}")
+        print(f"  Ollama (AI search): {'✅' if self.capabilities.get('ollama') else '❌ (fallback: basic)'}")
+        print(f"  Notifications: {'✅' if self.capabilities.get('notifications') else '❌'}")
+        
+        print("\n📁 Database health:")
+        with self.get_conn() as conn:
+            cursor = conn.cursor()
+            cursor.execute("PRAGMA integrity_check")
+            integrity = cursor.fetchone()[0]
+            print(f"  Integrity: {integrity}")
+            cursor.execute("SELECT COUNT(*) FROM files")
+            count = cursor.fetchone()[0]
+            print(f"  Indexed files: {count:,}")
+        
+        print("\n✅ Doctor complete.")
+```
+
+Add to the CLI parser:
+
+```python
+    # Doctor command
+    subparsers.add_parser('doctor', help='System diagnostics and capability report')
+```
+
+And in `main()`:
+
+```python
+    elif args.command == 'doctor':
+        clutter.doctor()
+```
+
+---
+
+## 📦 Commit Day 2
+
+```bash
+git add clutter.py tests/test_core.py
+git commit -m "feat: extract deletion recovery handler, add tests, add doctor command"
+git push origin main
+```
+
+---
+
+## 🚀 Ready for Day 2?
+
+Do you want me to:
+
+1. Provide the exact diffs for all these changes (already written above), or
+2. Walk through each step interactively as you paste the code and run tests?
+
+Your call. We're on a roll.
+
+
+
+(base) burdens@pop-os:~/clutterbot2.0$ pytest tests/test_core.py::TestTrackPullCommit::test_pull_snapshots_existing_sandbox -v
+============================= test session starts ==============================
+platform linux -- Python 3.13.11, pytest-9.0.2, pluggy-1.5.0 -- /home/burdens/miniconda3/bin/python3.13
+cachedir: .pytest_cache
+rootdir: /home/burdens/clutterbot2.0
+plugins: cov-7.0.0, asyncio-1.3.0, anyio-4.12.1
+asyncio: mode=Mode.STRICT, debug=False, asyncio_default_fixture_loop_scope=None, asyncio_default_test_loop_scope=function
+collected 1 item                                                               
+
+tests/test_core.py::TestTrackPullCommit::test_pull_snapshots_existing_sandbox PASSED [100%]
+
+============================== 1 passed in 0.06s ===============================
+(base) burdens@pop-os:~/clutterbot2.0$ pwd
+git rev-parse --show-toplevel
+rg -n "class TestDeletedFileRecovery" tests/test_core.py
+pytest --collect-only -q tests/test_core.py
+/home/burdens/clutterbot2.0
+/home/burdens/clutterbot2.0
+tests/test_core.py::TestTrackPullCommit::test_track_creates_metadata
+tests/test_core.py::TestTrackPullCommit::test_track_creates_ref_symlink
+tests/test_core.py::TestTrackPullCommit::test_track_creates_sandbox_dir
+tests/test_core.py::TestTrackPullCommit::test_pull_copies_original_to_sandbox
+tests/test_core.py::TestTrackPullCommit::test_commit_syncs_sandbox_back_to_original
+tests/test_core.py::TestTrackPullCommit::test_pull_snapshots_existing_sandbox
+
+6 tests collected in 0.01s
+(base) burdens@pop-os:~/clutterbot2.0$ 

@@ -540,6 +540,7 @@ JSON:"""
                 return "\033[0m"
 
             def _is_green(self, path):
+                """Check if a path change is clutter-managed (green) or external (red)."""
                 return self.outer._is_under_symlink(path) or bool(self.sandbox_path)
             
             def on_created(self, event):
@@ -555,7 +556,7 @@ JSON:"""
                 path = os.path.abspath(event.src_path)
                 # Log the change
                 self.outer._log_change('deleted', path, is_green=self._is_green(path))
-                # Handle recovery (this will prompt the user)
+                # Handle recovery (non-blocking in this context – but it's synchronous)
                 self.outer.handle_tracked_deletion(path)
             
             def on_moved(self, event):
@@ -1080,6 +1081,79 @@ JSON:"""
         print(f"✅ Commit complete")
         if snapshot_dest:
             print(f"   Previous original saved: {snapshot_dest}")
+
+    def handle_tracked_deletion(self, path):
+        """Handle deletion of a tracked original — interactive ghost recovery."""
+        with self.get_conn() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                "SELECT name, snapshot_path FROM tracked_items WHERE path = ?",
+                (path,)
+            )
+            row = cursor.fetchone()
+
+            if not row:
+                return  # Not a tracked item, nothing to do
+
+            name, snapshot_path = row
+            sandbox_path = self.base_dir / 'sandboxes' / name
+
+            # Check if sandbox has a working copy (ghost candidate)
+            has_ghost = any(
+                f.name != '.clutter_sandbox'
+                for f in sandbox_path.iterdir()
+            ) if sandbox_path.exists() else False
+
+            print(f"\n⚠️  TRACKED ITEM DELETED: {path}")
+            print(f"   This item is managed by Clutter as '{name}'")
+
+            if has_ghost:
+                print(f"   Ghost copy available in sandbox: {sandbox_path}")
+                print()
+                print(f"   [R] Restore — copy ghost back to original location")
+                print(f"   [G] Keep ghost — mark as ghost, decide later")
+                print(f"   [D] Delete for real — remove tracking and ghost")
+                choice = input("   Choice [R/g/d]: ").strip().lower()
+
+                if choice == 'd':
+                    conn.execute(
+                        "UPDATE tracked_items SET status = 'ghost' WHERE path = ?",
+                        (path,)
+                    )
+                    conn.commit()
+                    print(f"   Marked as ghost. Run 'clutter untrack {name}' to fully remove.")
+                elif choice == 'g':
+                    conn.execute(
+                        "UPDATE tracked_items SET status = 'ghost' WHERE path = ?",
+                        (path,)
+                    )
+                    conn.commit()
+                    print(f"   👻 Ghost preserved. Restore later with 'clutter commit {name}'")
+                else:
+                    # Restore from sandbox
+                    if sandbox_path.is_dir():
+                        os.makedirs(os.path.dirname(path), exist_ok=True)
+                        shutil.copytree(str(sandbox_path), path,
+                                       ignore=shutil.ignore_patterns('.clutter_sandbox'))
+                    else:
+                        src_file = sandbox_path / os.path.basename(path)
+                        if src_file.exists():
+                            shutil.copy2(str(src_file), path)
+
+                    print(f"   ✅ Restored to {path}")
+                    conn.execute(
+                        "UPDATE tracked_items SET status = 'tracked' WHERE path = ?",
+                        (path,)
+                    )
+                    conn.commit()
+            else:
+                print(f"   ⚠️  No ghost available (never pulled)")
+                print(f"   Cannot recover. Remove tracking with 'clutter untrack {name}'")
+                conn.execute(
+                    "UPDATE tracked_items SET status = 'ghost' WHERE path = ?",
+                    (path,)
+                )
+                conn.commit()
 
     def _is_under_symlink(self, path):
         """Check if path is a symlink or inside a symlinked directory"""

@@ -100,6 +100,36 @@ class TestTrackPullCommit:
 
         assert (original / 'file.txt').read_text() == 'world'
 
+    def test_pull_snapshots_existing_sandbox(self, temp_clutter):
+        clutter, tmpdir = temp_clutter
+        original = tmpdir / 'original'
+        original.mkdir()
+        (original / 'file.txt').write_text('v1')
+
+        clutter.track(str(original), 'myproj')
+        clutter.pull('myproj')
+
+        # Modify sandbox
+        sandbox = clutter.base_dir / 'sandboxes' / 'myproj'
+        (sandbox / 'file.txt').write_text('v2')
+
+        # Change original
+        (original / 'file.txt').write_text('v1_new')
+
+        # Pull again - should snapshot the v2 sandbox
+        clutter.pull('myproj')
+
+        # Verify snapshot was created
+        snapshot_root = clutter.base_dir / 'snapshots' / 'myproj'
+        assert snapshot_root.exists(), "Snapshot directory not created"
+        snapshots = list(snapshot_root.glob('pre_pull_*'))
+        assert len(snapshots) > 0, "No pre_pull snapshot found"
+
+        # Verify snapshot contains v2 content
+        if snapshots:
+            snapshot_file = snapshots[0] / 'file.txt'
+            assert snapshot_file.exists(), "Snapshot missing file.txt"
+            assert snapshot_file.read_text() == 'v2', "Snapshot content mismatch"
 
 class TestDeletedFileRecovery:
     """The concierge feature: detect deleted tracked original, offer restore"""
